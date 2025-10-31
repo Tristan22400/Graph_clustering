@@ -6,9 +6,10 @@ import pytest
 from auto_ot_ge.model import GraphEncoder, AutoEncoder
 
 
-def test_train_auto_ot_runs():
+def test_train_auto_ot_em_runs(): # <-- Renamed for clarity
     """
-    Tests if the train_auto_ot loop runs and updates parameters.
+    Tests if the train_auto_ot_em loop runs and updates parameters.
+    (This was your test_train_auto_ot_runs)
     """
     n, d_in = 100, 50
     k = 5
@@ -22,13 +23,14 @@ def test_train_auto_ot_runs():
     model = GraphEncoder(input_dim=d_in, hidden_dims=hidden_dims, k=k).to(device)
     
     # 2. Setup optimizers
-    # Optimizer for pre-training (just to initialize centroids)
     pretrain_optim = optim.Adam(model.parameters(), lr=1e-3)
     
-    # Optimizer for the main OT training
-    ot_optim = optim.Adam(model.parameters(), lr=1e-3)
+    # Optimizer for the main EM training
+    # This optimizer only *needs* to update the AE, but passing
+    # model.parameters() is fine.
+    em_optim = optim.Adam(model.parameters(), lr=1e-3)
 
-    # 3. Initialize centroids (requires scikit-learn)
+    # 3. Initialize centroids
     try:
         model.initialize_centroids(
             X, 
@@ -40,13 +42,12 @@ def test_train_auto_ot_runs():
         
     # 4. Store initial state
     init_centroids = model.cluster_centroids.data.clone()
-    # Get the weights of the first encoder layer
     init_encoder_weights = model.autoencoders[0].encoder.weight.data.clone()
     
-    # 5. Run one step of the Auto-OT training
-    model.train_auto_ot(
+    # 5. Run one step of the Auto-OT (EM) training
+    model.train_auto_ot_em(
         X,
-        optimizer=ot_optim,
+        optimizer=em_optim,
         T_epochs=1,
         gamma=0.1,
         epsilon_0=1.0,
@@ -55,14 +56,76 @@ def test_train_auto_ot_runs():
     
     # 6. Check if parameters were updated
     
-    # Check M-Step: Centroids should have changed
+    # Check M-Step: Centroids should have changed (manual update)
     final_centroids = model.cluster_centroids.data
     assert not torch.allclose(init_centroids, final_centroids)
     assert final_centroids.shape == (k, latent_dim)
     
-    # Check Encoder Update: Encoder weights should have changed
+    # Check Encoder Update: Encoder weights should have changed (optim update)
     final_encoder_weights = model.autoencoders[0].encoder.weight.data
     assert not torch.allclose(init_encoder_weights, final_encoder_weights)
+
+# --- NEW TEST FOR THE JOINT FUNCTION ---
+
+def test_train_auto_ot_joint_runs():
+    """
+    Tests if the train_auto_ot_joint loop runs and updates ALL parameters
+    (encoder and centroids) simultaneously via the optimizer.
+    """
+    n, d_in = 100, 50
+    k = 5
+    hidden_dims = [30, 10]
+    latent_dim = hidden_dims[-1]
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # 1. Create data and model
+    X = torch.rand(n, d_in, device=device)
+    model = GraphEncoder(input_dim=d_in, hidden_dims=hidden_dims, k=k).to(device)
+    
+    # 2. Setup optimizers
+    pretrain_optim = optim.Adam(model.parameters(), lr=1e-3)
+    
+    # Optimizer for the main JOINT training
+    # MUST include all model parameters: model.parameters()
+    joint_optim = optim.Adam(model.parameters(), lr=1e-3)
+
+    # 3. Initialize centroids
+    try:
+        model.initialize_centroids(
+            X, 
+            pretrain_optimizer=pretrain_optim, 
+            pretrain_iters=5 
+        )
+    except ImportError:
+        pytest.skip("scikit-learn not installed. Skipping centroid init test.")
+        
+    # 4. Store initial state
+    init_centroids = model.cluster_centroids.data.clone()
+    init_encoder_weights = model.autoencoders[0].encoder.weight.data.clone()
+    
+    # 5. Run one step of the Auto-OT JOINT training
+    model.train_auto_ot_joint(
+        X,
+        optimizer=joint_optim,
+        T_epochs=1,
+        gamma=0.1,
+        epsilon_0=1.0,
+        rho=0.99
+    )
+    
+    # 6. Check if parameters were updated
+    
+    # Centroids should have changed (updated by joint_optim)
+    final_centroids = model.cluster_centroids.data
+    assert not torch.allclose(init_centroids, final_centroids)
+    assert final_centroids.shape == (k, latent_dim)
+    
+    # Encoder weights should have changed (updated by joint_optim)
+    final_encoder_weights = model.autoencoders[0].encoder.weight.data
+    assert not torch.allclose(init_encoder_weights, final_encoder_weights)
+
+# --- YOUR OTHER TESTS (UNCHANGED) ---
 
 def test_autoencoder_shapes():
     """Test the basic AutoEncoder stub's shapes."""
@@ -131,7 +194,7 @@ def test_compute_cost_matrix_properties():
 
 def test_train_auto_ot_m_step_fixed_point():
     """
-    Tests the M-Step (centroid update) logic.
+    Tests the M-Step (centroid update) logic in train_auto_ot_em.
     If Z = M, the centroids should not move.
     """
     n, d_latent, k = 2, 2, 2
@@ -156,8 +219,8 @@ def test_train_auto_ot_m_step_fixed_point():
     # Optimizer (only for encoder, but won't be used as loss_rec=0)
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
     
-    # 5. Run one training step
-    model.train_auto_ot(
+    # 5. Run one training step of the EM method
+    model.train_auto_ot_em(
         X,
         optimizer=optimizer,
         T_epochs=1,
