@@ -389,6 +389,90 @@ class GraphEncoder(torch.nn.Module):
                 ot=loss_ot.item(),
                 eps=epsilon_t
             )
+
+    # --- 5. (Option 2) Fully Joint Training (My addition) ---
+    def train_auto_ot_joint(
+        self: 'GraphEncoder',
+        X: torch.Tensor,
+        optimizer: torch.optim.Optimizer,
+        T_epochs: int,
+        gamma: float,       # OT loss weight [cite: 172]
+        epsilon_0: float,   # Initial epsilon [cite: 189]
+        rho: float,         # Annealing rate [cite: 190]
+        beta: float = 1.0,  # Sparsity weight
+        rho_kl: float = 0.01 # Sparsity target
+    ) -> None:
+        """
+        Trains the Auto-OT-GE model using a fully joint optimization.
+        Both the Autoencoder (Theta) and Centroids (M) are updated
+        via backpropagation from a single composite loss. 
+        
+        **IMPORTANT**: The 'optimizer' MUST be initialized with
+        list(self.parameters()) so it includes 'self.cluster_centroids'.
+        """
+        
+        n = X.shape[0]
+        a = torch.full((n,), 1.0 / n, device=X.device, dtype=X.dtype) # [cite: 255]
+        w = torch.full((self.k,), 1.0 / self.k, device=X.device, dtype=X.dtype) # [cite: 255]
+        
+        pbar = tqdm.tqdm(range(T_epochs), desc="Training Auto-OT (Joint)")
+        for t in pbar:
+            # --- 1. Zero Gradients ---
+            optimizer.zero_grad()
+            
+            # --- 2. Anneal Regularization [cite: 248] ---
+            epsilon_t = epsilon_0 * (rho ** (t / T_epochs))
+
+            # --- 3. Forward Pass (Encoder -> Z, Decoder -> X_hat) ---
+            Z = self.encode(X) # [cite: 239]
+            X_hat = self.decode(Z) # [cite: 243]
+            
+            # --- 4. Compute Reconstruction & Sparsity Losses ---
+            loss_rec = F.mse_loss(X_hat, X, reduction='sum') # [cite: 245]
+            
+            rho_hat = torch.mean(Z, dim=0).clamp(min=1e-6, max=1.0 - 1e-6)
+            kl_div = rho_kl * torch.log(rho_kl / rho_hat) + \
+                     (1 - rho_kl) * torch.log((1 - rho_kl) / (1 - rho_hat))
+            loss_kl = beta * torch.sum(kl_div) # [cite: 135]
+            
+            # --- 5. Compute Differentiable OT Loss ---
+            
+            # Get current centroids (which are nn.Parameters)
+            M = self.cluster_centroids # [cite: 149]
+            
+            # Compute cost matrix. Gradients will flow to Z and M.
+            cost_matrix = self.compute_cost_matrix(Z, M) # [cite: 252]
+            
+            # Compute OT plan pi.
+            # This is done *inside* the gradient graph.
+            pi_t = sinkhorn_log_domain(
+                cost_matrix,
+                epsilon=epsilon_t,
+                a=a,
+                b=w,
+                n_iters=50
+            ) # [cite: 167-168]
+            
+            # Compute the entropic OT loss value [cite: 165, 269]
+            # L_OT_e = <C, pi> - e * H(pi)
+            # H(pi) = -sum(pi * log(pi))
+            transport_cost_term = torch.sum(pi_t * cost_matrix)
+            # Add entropy term (note: paper loss has -epsilon * H(pi))
+            entropy_term = epsilon_t * torch.sum(pi_t * torch.log(pi_t + 1e-10))
+            loss_ot = transport_cost_term + entropy_term
+            
+            # --- 6. Total Loss & Backward Pass [cite: 271] ---
+            loss_total = loss_rec + loss_kl + gamma * loss_ot
+            
+            loss_total.backward()
+            optimizer.step()
+            
+            pbar.set_postfix(
+                loss=loss_total.item(),
+                rec=loss_rec.item(),
+                ot=loss_ot.item(),
+                eps=epsilon_t
+            )
     
     @torch.no_grad()
     def get_cluster_assignments(self: 'GraphEncoder', X: torch.Tensor) -> torch.Tensor:
