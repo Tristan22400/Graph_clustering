@@ -282,7 +282,7 @@ class GraphEncoder(torch.nn.Module):
         return torch.clamp(cost, min=0.0)
 
     # --- 4. Main Auto-OT-GE Training Loop ---
-    def train_auto_ot(
+    def train_auto_ot_em(
         self: 'GraphEncoder',
         X: torch.Tensor,
         optimizer: torch.optim.Optimizer,
