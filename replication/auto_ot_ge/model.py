@@ -218,7 +218,7 @@ class GraphEncoder(torch.nn.Module):
         self.train_pretrain(
             X=X,
             compile_model=False,
-            train_mode='layerwise',
+            train_mode='endtoend',
             iters=pretrain_iters,
             optimizer=pretrain_optimizer,
             batch_size=256

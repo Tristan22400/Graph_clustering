@@ -76,10 +76,6 @@ def sinkhorn_log_domain(
     # Our u, v are already log(u) and log(v)
     log_pi = u.unsqueeze(1) + v.unsqueeze(0) + log_K
     
-    # ----------------
-    # --- FIX END ----
-    # ----------------
-
     pi = torch.exp(log_pi)
     
     return pi
