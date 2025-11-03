@@ -3,7 +3,9 @@ import torch
 import torch.optim as optim
 import copy
 import pytest
-from auto_ot_ge.model import GraphEncoder, AutoEncoder
+from replication.auto_ot_ge.model import GraphEncoder, AutoEncoder
+
+
 
 
 def test_train_auto_ot_em_runs(): # <-- Renamed for clarity

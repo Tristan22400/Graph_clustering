@@ -1,7 +1,7 @@
 # Save this as tests/test_sinkhorn.py
 import torch
 import pytest
-from auto_ot_ge.sinkhorn import sinkhorn_log_domain
+from replication.auto_ot_ge.sinkhorn import sinkhorn_log_domain
 
 def test_sinkhorn_marginals():
     """

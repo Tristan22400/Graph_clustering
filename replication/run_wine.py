@@ -6,6 +6,7 @@ import sklearn.datasets
 import sklearn.preprocessing
 import sklearn.metrics
 import sklearn.cluster
+from scipy.optimize import linear_sum_assignment
 
 # --- Import your model ---
 from auto_ot_ge.model import GraphEncoder
@@ -39,11 +40,12 @@ hidden_dims = [64, 32]  # AE layers, last one is latent_dim
 latent_dim = hidden_dims[-1]
 T_epochs_pre_training = 5000
 T_epochs_OT_training = 1000
-T_epochs_JOINT_training = 6000
+T_epochs_JOINT_training = 100
 gamma = 0.01
-epsilon_0 = 0.01
-rho = 0.9
+epsilon_0 = 0.05
+rho = 0.5
 lr = 1e-2
+
 
 # -------------------------
 # 3. Initialize Model
@@ -70,12 +72,36 @@ init_labels = model.get_initial_assignments().cpu().numpy()
 # 5. Evaluation Helper
 # -------------------------
 def evaluate_clustering(y_true, y_pred, method_name="Method"):
-    nmi = sklearn.metrics.normalized_mutual_info_score(y_true, y_pred)
-    ari = sklearn.metrics.adjusted_rand_score(y_true, y_pred)
+    y_pred_aligned = best_cluster_mapping(y_true, y_pred)
+    nmi = sklearn.metrics.normalized_mutual_info_score(y_true, y_pred_aligned)
+    ari = sklearn.metrics.adjusted_rand_score(y_true, y_pred_aligned)
     print(f"{method_name} Results:")
     print(f"  NMI: {nmi:.4f}")
     print(f"  ARI: {ari:.4f}\n")
     return nmi, ari
+
+def best_cluster_mapping(y_true, y_pred):
+    """
+    Permute cluster labels in y_pred to match y_true as well as possible
+    using the Hungarian algorithm (linear_sum_assignment).
+    """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    assert y_true.size == y_pred.size
+
+    # Build contingency matrix (confusion matrix)
+    D = max(y_pred.max(), y_true.max()) + 1
+    cost_matrix = np.zeros((D, D), dtype=np.int64)
+    for i in range(y_pred.size):
+        cost_matrix[y_pred[i], y_true[i]] += 1
+
+    # Hungarian algorithm maximizes matching
+    row_ind, col_ind = linear_sum_assignment(cost_matrix.max() - cost_matrix)
+    mapping = dict(zip(row_ind, col_ind))
+
+    # Apply permutation to predictions
+    y_pred_aligned = np.array([mapping.get(label, label) for label in y_pred])
+    return y_pred_aligned
 
 # -------------------------
 # 6. Auto-OT-GE Training (Experiment 1: EM-Style)

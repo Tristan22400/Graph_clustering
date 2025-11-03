@@ -390,89 +390,88 @@ class GraphEncoder(torch.nn.Module):
                 eps=epsilon_t
             )
 
-    # --- 5. (Option 2) Fully Joint Training (My addition) ---
     def train_auto_ot_joint(
         self: 'GraphEncoder',
         X: torch.Tensor,
         optimizer: torch.optim.Optimizer,
         T_epochs: int,
-        gamma: float,       # OT loss weight [cite: 172]
-        epsilon_0: float,   # Initial epsilon [cite: 189]
-        rho: float,         # Annealing rate [cite: 190]
-        beta: float = 1.0,  # Sparsity weight
-        rho_kl: float = 0.01 # Sparsity target
+        gamma: float = 1.0,
+        epsilon_0: float = 0.05,  # initial epsilon scaled for normalized embeddings
+        rho: float = 0.5,         # faster annealing
+        beta: float = 1.0,
+        rho_kl: float = 0.01
     ) -> None:
         """
-        Trains the Auto-OT-GE model using a fully joint optimization.
-        Both the Autoencoder (Theta) and Centroids (M) are updated
-        via backpropagation from a single composite loss. 
-        
-        **IMPORTANT**: The 'optimizer' MUST be initialized with
-        list(self.parameters()) so it includes 'self.cluster_centroids'.
+        Fully joint training of Auto-OT-GE model with:
+            - Proper embedding/centroid normalization
+            - Fixed Sinkhorn iterations (stable)
+            - Tracking: NCut, row entropy, pi_t stats
+            - Epsilon annealing safe for small/normalized costs
         """
-        
         n = X.shape[0]
-        a = torch.full((n,), 1.0 / n, device=X.device, dtype=X.dtype) # [cite: 255]
-        w = torch.full((self.k,), 1.0 / self.k, device=X.device, dtype=X.dtype) # [cite: 255]
-        
-        pbar = tqdm.tqdm(range(T_epochs), desc="Training Auto-OT (Joint)")
-        for t in pbar:
-            # --- 1. Zero Gradients ---
-            optimizer.zero_grad()
-            
-            # --- 2. Anneal Regularization [cite: 248] ---
-            epsilon_t = epsilon_0 * (rho ** (t / T_epochs))
+        a = torch.full((n,), 1.0 / n, device=X.device, dtype=X.dtype)
+        w = torch.full((self.k,), 1.0 / self.k, device=X.device, dtype=X.dtype)
 
-            # --- 3. Forward Pass (Encoder -> Z, Decoder -> X_hat) ---
-            Z = self.encode(X) # [cite: 239]
-            X_hat = self.decode(Z) # [cite: 243]
-            
-            # --- 4. Compute Reconstruction & Sparsity Losses ---
-            loss_rec = F.mse_loss(X_hat, X, reduction='sum') # [cite: 245]
-            
-            rho_hat = torch.mean(Z, dim=0).clamp(min=1e-6, max=1.0 - 1e-6)
-            kl_div = rho_kl * torch.log(rho_kl / rho_hat) + \
-                     (1 - rho_kl) * torch.log((1 - rho_kl) / (1 - rho_hat))
-            loss_kl = beta * torch.sum(kl_div) # [cite: 135]
-            
-            # --- 5. Compute Differentiable OT Loss ---
-            
-            # Get current centroids (which are nn.Parameters)
-            M = self.cluster_centroids # [cite: 149]
-            
-            # Compute cost matrix. Gradients will flow to Z and M.
-            cost_matrix = self.compute_cost_matrix(Z, M) # [cite: 252]
-            
-            # Compute OT plan pi.
-            # This is done *inside* the gradient graph.
-            pi_t = sinkhorn_log_domain(
-                cost_matrix,
-                epsilon=epsilon_t,
-                a=a,
-                b=w,
-                n_iters=50
-            ) # [cite: 167-168]
-            
-            # Compute the entropic OT loss value [cite: 165, 269]
-            # L_OT_e = <C, pi> - e * H(pi)
-            # H(pi) = -sum(pi * log(pi))
-            transport_cost_term = torch.sum(pi_t * cost_matrix)
-            # Add entropy term (note: paper loss has -epsilon * H(pi))
-            entropy_term = epsilon_t * torch.sum(pi_t * torch.log(pi_t + 1e-10))
-            loss_ot = transport_cost_term + entropy_term
-            
-            # --- 6. Total Loss & Backward Pass [cite: 271] ---
+        sinkhorn_iters = 30
+
+        print("Starting joint training with normalized embeddings and safe Sinkhorn...")
+
+        for t in range(T_epochs):
+            optimizer.zero_grad()
+
+            # Encode/decode
+            Z = self.encode(X)
+            X_hat = self.decode(Z)
+
+            # Reconstruction loss
+            loss_rec = F.mse_loss(X_hat, X, reduction='sum')
+
+            # Sparsity KL loss
+            rho_hat = torch.mean(Z, dim=0).clamp(1e-6, 1.0 - 1e-6)
+            kl_div = rho_kl * torch.log(rho_kl / rho_hat) + (1 - rho_kl) * torch.log((1 - rho_kl) / (1 - rho_hat))
+            loss_kl = beta * torch.sum(kl_div)
+
+            # Normalize embeddings and centroids
+            Z_norm = (Z - Z.mean(dim=0)) / (Z.std(dim=0) + 1e-6)
+            M = self.cluster_centroids
+            M_norm = (M - M.mean(dim=0)) / (M.std(dim=0) + 1e-6)
+
+            # Compute cost matrix
+            cost_matrix = self.compute_cost_matrix(Z_norm, M_norm)
+            cost_matrix = cost_matrix / (cost_matrix.std() + 1e-6)
+
+            # Anneal epsilon
+            epsilon_t = max(epsilon_0 * (rho ** (t / T_epochs)), 1e-5)
+
+            # Fixed Sinkhorn iterations
+            pi_t = sinkhorn_log_domain(cost_matrix, epsilon=epsilon_t, a=a, b=w, n_iters=sinkhorn_iters)
+
+            # Entropic OT loss
+            transport_cost = torch.sum(pi_t * cost_matrix)
+            entropy = epsilon_t * torch.sum(pi_t * torch.log(pi_t + 1e-10))
+            loss_ot = transport_cost + entropy
+
+            # Total loss & backward
             loss_total = loss_rec + loss_kl + gamma * loss_ot
-            
             loss_total.backward()
             optimizer.step()
-            
-            pbar.set_postfix(
-                loss=loss_total.item(),
-                rec=loss_rec.item(),
-                ot=loss_ot.item(),
-                eps=epsilon_t
-            )
+
+            # --- Tracking every 5-10% of epochs ---
+            if t % max(1, T_epochs // 20) == 0:
+                # Soft NCut
+                ncut_val = compute_ncut(X, pi_t)
+                # Row-wise entropy
+                row_entropy = (-pi_t * torch.log(pi_t + 1e-10)).sum(dim=1).mean().item()
+
+                print(f"\n[Epoch {t}/{T_epochs}]")
+                print(f"loss_total: {loss_total.item():.4f}, rec: {loss_rec.item():.4f}, kl: {loss_kl.item():.4f}, ot: {loss_ot.item():.4f}")
+                print(f"epsilon_t: {epsilon_t:.6f}, row entropy: {row_entropy:.6f}")
+                print(f"Sinkhorn row error: {torch.max(torch.abs(pi_t.sum(dim=1)-a)).item():.6e}, col error: {torch.max(torch.abs(pi_t.sum(dim=0)-w)).item():.6e}")
+                print(f"pi_t stats -> min: {pi_t.min().item():.6e}, max: {pi_t.max().item():.6e}, mean: {pi_t.mean().item():.6e}")
+                print(f"Z stats -> min: {Z.min().item():.6e}, max: {Z.max().item():.6e}, mean: {Z.mean().item():.6e}")
+                print(f"M stats -> min: {M.min().item():.6e}, max: {M.max().item():.6e}, mean: {M.mean().item():.6e}")
+                print(f"NCut (soft): {ncut_val:.6f}")
+
     
     @torch.no_grad()
     def get_cluster_assignments(self: 'GraphEncoder', X: torch.Tensor) -> torch.Tensor:
@@ -502,3 +501,26 @@ class GraphEncoder(torch.nn.Module):
         assignments = torch.argmin(cost_matrix, dim=1)
         
         return assignments
+
+def compute_ncut(S: torch.Tensor, pi: torch.Tensor) -> float:
+    """
+    Computes the approximate NCut of a soft cluster assignment pi on similarity matrix S.
+
+    Args:
+        S: Similarity matrix, shape [n, n]
+        pi: Soft cluster assignment, shape [n, k]
+
+    Returns:
+        ncut_value: float
+    """
+    # Compute cluster volumes: vol(A_j) = sum_i pi_ij * degree_i
+    degrees = S.sum(dim=1)  # degree vector [n]
+    ncut = 0.0
+    k = pi.shape[1]
+    for j in range(k):
+        assign = pi[:, j]  # soft assignment vector
+        vol_j = torch.sum(assign * degrees) + 1e-8
+        # cut(Aj, rest) = sum_{i,l} S_il * assign_i * (1 - assign_l)
+        cut_j = torch.sum(S * (assign.unsqueeze(1) * (1.0 - assign.unsqueeze(0))))
+        ncut += cut_j / vol_j
+    return ncut.item()
