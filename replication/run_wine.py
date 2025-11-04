@@ -36,27 +36,25 @@ print(f"Using device: {device}")
 # -------------------------
 # 2. Hyperparameters
 # -------------------------
-hidden_dims = [64, 32]  # AE layers, last one is latent_dim
+hidden_dims = [64, 2]  # AE layers, last one is latent_dim
 latent_dim = hidden_dims[-1]
-T_epochs_pre_training = 5000
+T_epochs_pre_training = 50000
 T_epochs_OT_training = 1000
-T_epochs_JOINT_training = 100
-gamma = 0.01
-epsilon_0 = 0.05
-rho = 0.5
-lr = 1e-2
+T_epochs_JOINT_training = 5000
+lr = 1e-4
 
 
 # -------------------------
 # 3. Initialize Model
 # -------------------------
-model = GraphEncoder(input_dim=input_dim, hidden_dims=hidden_dims, k=n_clusters).to(device)
+model = GraphEncoder(input_dim=input_dim, hidden_dims=hidden_dims, k=n_clusters, X=X_tensor).to(device)
 
 # -------------------------
 # 4. Pre-train and initialize centroids
 # -------------------------
 print("Initializing centroids via layer-wise pre-training and k-means...")
-pretrain_optim = optim.Adam(model.parameters(), lr=lr)
+pretrain_optim = optim.Adam(list(model.parameters()) + [model.cluster_centroids] + [model.centroid_logits], lr=lr)
+print("model before pre-training:", model)
 model.initialize_centroids(
     X_tensor,
     pretrain_optimizer=pretrain_optim,
@@ -104,37 +102,6 @@ def best_cluster_mapping(y_true, y_pred):
     return y_pred_aligned
 
 # -------------------------
-# 6. Auto-OT-GE Training (Experiment 1: EM-Style)
-# -------------------------
-print(f"Starting Auto-OT-GE training (EM-Style) for {T_epochs_OT_training} epochs...")
-# We use a fresh optimizer for this training run
-em_optim = optim.Adam(model.parameters(), lr=lr)
-model.train()
-# --- Corrected function call to match model file ---
-model.train_auto_ot_em(
-    X=X_tensor,
-    optimizer=em_optim,
-    T_epochs=T_epochs_OT_training,
-    gamma=gamma,
-    epsilon_0=epsilon_0,
-    rho=rho,
-    beta=1.0,  # sparsity weight
-    rho_kl=0.01
-)
-print("EM training complete.\n")
-
-# --- Evaluate EM Method ---
-y_pred_auto_ot_em = model.get_cluster_assignments(X_tensor).cpu().numpy()
-nmi_em, ari_em = evaluate_clustering(y_true, y_pred_auto_ot_em, "Auto-OT-GE (EM)")
-
-print("Evaluating clustering via KMeans on (EM) latent space...")
-latent_em = model.encode(X_tensor).cpu().detach().numpy()
-kmeans_em = sklearn.cluster.KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-y_pred_kmeans_em = kmeans_em.fit_predict(latent_em)
-nmi_kmeans_em, ari_kmeans_em = evaluate_clustering(y_true, y_pred_kmeans_em, "KMeans on Latent Space (EM)")
-
-
-# -------------------------
 # 7. Auto-OT-GE Training (Experiment 2: Joint)
 # -------------------------
 print("--- Resetting model to initial state for Joint training ---")
@@ -149,11 +116,7 @@ model.train_auto_ot_joint(
     X=X_tensor,
     optimizer=joint_optim,
     T_epochs=T_epochs_JOINT_training,
-    gamma=gamma,
-    epsilon_0=epsilon_0,
-    rho=rho,
-    beta=1.0,  # sparsity weight
-    rho_kl=0.01
+    Y_true=torch.tensor(y_true, dtype=torch.long).to(device)
 )
 print("Joint training complete.\n")
 
@@ -167,6 +130,8 @@ kmeans_joint = sklearn.cluster.KMeans(n_clusters=n_clusters, random_state=42, n_
 y_pred_kmeans_joint = kmeans_joint.fit_predict(latent_joint)
 nmi_kmeans_joint, ari_kmeans_joint = evaluate_clustering(y_true, y_pred_kmeans_joint, "KMeans on Latent Space (Joint)")
 
+print(y_pred_auto_ot_joint, "<-- Joint assignments")
+print(y_true, "<-- True labels")
 
 # -------------------------
 # 8. Evaluate Initial Clustering
@@ -179,9 +144,9 @@ nmi_init, ari_init = evaluate_clustering(y_true, init_labels, "Initial KMeans on
 print("--- Summary of Clustering Performance ---")
 print(f"{'Method':45} {'NMI':>6} {'ARI':>6}")
 print("-" * 59)
-print(f"{'Auto-OT-GE (EM)':45} {nmi_em:6.4f} {ari_em:6.4f}")
+#print(f"{'Auto-OT-GE (EM)':45} {nmi_em:6.4f} {ari_em:6.4f}")
 print(f"{'Auto-OT-GE (Joint)':45} {nmi_joint:6.4f} {ari_joint:6.4f}")
 print("-" * 59)
-print(f"{'KMeans on Latent Space (EM)':45} {nmi_kmeans_em:6.4f} {ari_kmeans_em:6.4f}")
+#print(f"{'KMeans on Latent Space (EM)':45} {nmi_kmeans_em:6.4f} {ari_kmeans_em:6.4f}")
 print(f"{'KMeans on Latent Space (Joint)':45} {nmi_kmeans_joint:6.4f} {ari_kmeans_joint:6.4f}")
 print(f"{'Initial KMeans (Pre-trained)':45} {nmi_init:6.4f} {ari_init:6.4f}")
