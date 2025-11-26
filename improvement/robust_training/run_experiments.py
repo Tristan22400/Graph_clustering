@@ -17,6 +17,9 @@ import os
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("error", category=sklearn.exceptions.ConvergenceWarning)
 
+# Define constants
+NUMBER_OF_EPOCHS = 10000
+
 # Optimization for GPU
 if torch.cuda.is_available():
     # TensorFloat-32 requires Compute Capability >= 8.0 (Ampere)
@@ -271,7 +274,7 @@ def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100):
 
     # --- 1. Baseline: Standard K-Means on Raw Data ---
     print("[-] Running Baseline: K-Means on Raw Data...")
-    km_nmi, km_ncut = evaluate_clustering(nts, s, y, n_tests=20) 
+    km_nmi, km_ncut = evaluate_clustering(nts, s, y, n_tests=nb_kmeans_tests) 
     
     # --- 2. Baseline: Spectral Clustering ---
     print("[-] Running Baseline: Spectral Clustering...")
@@ -311,7 +314,7 @@ def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100):
         beta = trial.suggest_float("beta", 1e-2, 1e3, log=True)
         lr = trial.suggest_float("lr", 1e-3, 1e-2, log=True)
         
-        nb_epochs_options = [10000]
+        nb_epochs_options = [NUMBER_OF_EPOCHS]
         epochs = nb_epochs_options[trial.suggest_int("nb_epochs_index", 0, len(nb_epochs_options)-1)]
 
         latent_dim = int(x_tensor.shape[1] * dim_decay_rate)
@@ -347,16 +350,15 @@ def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100):
                 return float('inf')
             
             try:
-                avg_nmi, avg_ncut = evaluate_clustering(encoded_np, s, y, n_tests=10)
-                
-                # KEY CHANGE:
+                nmi_test, ncut_test = evaluate_clustering(encoded_np, s, y, n_tests=nb_kmeans_tests)
+            
                 # We only record the NMI if the Ncut is better than what we've seen.
                 # This mimics "Real Life" selection where we only know Ncut.
-                if avg_ncut < best_ncut_val:
-                    best_ncut_val = avg_ncut
-                    nmi_of_best_ncut = avg_nmi
+                if ncut_test < best_ncut_val:
+                    best_ncut_val = ncut_test
+                    nmi_of_best_ncut = nmi_test
                 
-                return avg_ncut
+                return ncut_test
             except sklearn.exceptions.ConvergenceWarning:
                 return float('inf')
 
@@ -386,7 +388,7 @@ def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100):
         lr = trial.suggest_float("lr", 1e-3, 1e-2, log=True)
         noise_level = trial.suggest_float("noise_level", 0.1, 0.2)
         
-        nb_epochs_options = [10000]
+        nb_epochs_options = [NUMBER_OF_EPOCHS]
         epochs = nb_epochs_options[trial.suggest_int("nb_epochs_index", 0, len(nb_epochs_options)-1)]
 
         latent_dim = int(x_tensor.shape[1] * dim_decay_rate)
@@ -422,13 +424,13 @@ def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100):
                 return float('inf')
             
             try:
-                avg_nmi, avg_ncut = evaluate_clustering(encoded_np, s, y, n_tests=10)
+                nmi_test, ncut_test = evaluate_clustering(encoded_np, s, y, n_tests=nb_kmeans_tests)
                 
-                if avg_ncut < study_robust_best_ncut:
-                    study_robust_best_ncut = avg_ncut
-                    study_robust_best_nmi = avg_nmi
+                if ncut_test < study_robust_best_ncut:
+                    study_robust_best_ncut = ncut_test
+                    study_robust_best_nmi = nmi_test
                 
-                return avg_ncut
+                return ncut_test
             except sklearn.exceptions.ConvergenceWarning:
                 return float('inf')
 
@@ -450,8 +452,8 @@ def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100):
     # Rows
     print(f"{'K-Means (Raw Data)':<25} | {km_nmi:<22.4f} | {km_ncut:<22.4f}")
     print(f"{'Spectral Clustering':<25} | {spec_nmi:<22.4f} | {spec_ncut:<22.4f}")
-    print(f"{'Autoencoder (Optuna)':<25} | {nmi_of_best_ncut:<22.4f} | {study.best_value:<22.4f}")
-    print(f"{'Robust SAE (Optuna)':<25} | {study_robust_best_nmi:<22.4f} | {study_robust.best_value:<22.4f}")
+    print(f"{'Autoencoder (Optuna)':<25} | {nmi_of_best_ncut:<22.4f} | {study.best_value:<22.4f} ")
+    print(f"{'Robust SAE (Optuna)':<25} | {study_robust_best_nmi:<22.4f} | {study_robust.best_value:<22.4f} | {study_robust_best_ncut:<22.4f}")
     
     print("-" * 70)
     print(f"[*] Best AE Params: {study.best_params}")
@@ -465,9 +467,11 @@ def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100):
         "Spectral_NMI": spec_nmi,
         "Spectral_Ncut": spec_ncut,
         "AE_NMI": nmi_of_best_ncut,
-        "AE_Ncut": study.best_value,
+        "AE_Ncut": best_ncut_val,
+        "AE_Ncut_Optuna": study.best_value,
         "RobustSAE_NMI": study_robust_best_nmi,
         "RobustSAE_Ncut": study_robust_best_ncut,
+        "RobustSAE_Ncut_Optuna": study_robust.best_value,
         "AE_Params": str(study.best_params),
         "RobustSAE_Params": str(study_robust.best_params)
     }
@@ -503,8 +507,8 @@ if __name__ == "__main__":
         "Dataset", 
         "KMeans_NMI", "KMeans_Ncut", 
         "Spectral_NMI", "Spectral_Ncut", 
-        "AE_NMI", "AE_Ncut", 
-        "RobustSAE_NMI", "RobustSAE_Ncut",
+        "AE_NMI", "AE_Ncut", "AE_Ncut_Optuna",
+        "RobustSAE_NMI", "RobustSAE_Ncut", "RobustSAE_Ncut_Optuna",
         "AE_Params", "RobustSAE_Params"
     ]
     
