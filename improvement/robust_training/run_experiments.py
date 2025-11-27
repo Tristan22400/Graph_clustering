@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("error", category=sklearn.exceptions.ConvergenceWarning)
 
 # Define constants
-NUMBER_OF_EPOCHS = 10000
+NUMBER_OF_EPOCHS = 25000
 
 # Optimization for GPU
 if torch.cuda.is_available():
@@ -87,24 +87,13 @@ class GraphEncoder(torch.nn.Module):
             
             # Optimization: Compile the model
             training_model = autoencoder
-            
-            # Check if compilation is supported (Triton requires Compute Capability >= 7.0 for CUDA)
-            use_compile = hasattr(torch, "compile")
-            if use_compile and torch.cuda.is_available() and "cuda" in str(device):
-                if torch.cuda.get_device_capability()[0] < 7:
-                    use_compile = False
-
-            if use_compile:
-                try:
-                    training_model = torch.compile(autoencoder)
-                except Exception as e:
-                    print(f"[!] Failed to compile layer {i+1}: {e}")
 
             dataset = torch.utils.data.TensorDataset(current_input)
             dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
             
             desc = f"Training Layer {i+1}/{len(self.autoencoders)}"
-            for _ in tqdm.tqdm(range(epochs_per_layer), desc=desc, leave=False):
+            pbar = tqdm.tqdm(range(epochs_per_layer), desc=desc, leave=False)
+            for _ in pbar:
                 for (x_batch,) in dataloader:
                     x_batch = x_batch.to(device)
                     optimizer.zero_grad()
@@ -112,6 +101,7 @@ class GraphEncoder(torch.nn.Module):
                     loss = self._compute_loss(x_batch, decoded, encoded, rho, beta)
                     loss.backward()
                     optimizer.step()
+                    pbar.set_postfix(loss=loss.item())
             
             with torch.no_grad():
                 current_input = torch.sigmoid(autoencoder.encoder(current_input))
@@ -133,24 +123,15 @@ class DenoisingGraphEncoder(GraphEncoder):
             
             # Optimization: Compile the model
             training_model = autoencoder
-            
-            # Check if compilation is supported (Triton requires Compute Capability >= 7.0 for CUDA)
-            use_compile = hasattr(torch, "compile")
-            if use_compile and torch.cuda.is_available() and "cuda" in str(device):
-                if torch.cuda.get_device_capability()[0] < 7:
-                    use_compile = False
 
-            if use_compile:
-                try:
-                    training_model = torch.compile(autoencoder)
-                except Exception as e:
-                    print(f"[!] Failed to compile layer {i+1}: {e}")
+            
 
             dataset = torch.utils.data.TensorDataset(current_input)
             dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
             
             desc = f"Training Robust Layer {i+1}/{len(self.autoencoders)}"
-            for _ in tqdm.tqdm(range(epochs_per_layer), desc=desc, leave=False):
+            pbar = tqdm.tqdm(range(epochs_per_layer), desc=desc, leave=False)
+            for _ in pbar:
                 for (x_batch,) in dataloader:
                     x_batch = x_batch.to(device)
                     
@@ -166,6 +147,7 @@ class DenoisingGraphEncoder(GraphEncoder):
                     loss = self._compute_loss(x_batch, decoded, encoded, rho, beta)
                     loss.backward()
                     optimizer.step()
+                    pbar.set_postfix(loss=loss.item())
             
             # Generate next layer's input using CLEAN previous layer output
             with torch.no_grad():
@@ -480,23 +462,12 @@ if __name__ == "__main__":
     import csv
     
     # List of all datasets to run
-    datasets = [
-        'wine',
-        'email', 
-        'football', 
-        'karate', 
-        'polbooks',
-        'lfr_0.01', 
-        'lfr_0.05', 
-        'lfr_0.10',
-        'lfr_0.20',
-        'lfr_0.30', 
-        'lfr_0.40', 
-        'lfr_0.50',
+    datasets = [ 
+        'polbooks', 'football'
     ]
     
     # Configuration
-    n_trials = 20
+    n_trials = 10
     kmeans_tests = 100
     output_file = "experiment_results_1.csv"
     
