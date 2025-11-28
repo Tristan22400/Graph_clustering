@@ -10,8 +10,10 @@ import sklearn.preprocessing
 import networkx as nx
 import random
 import warnings
-import argparse
 import os
+import csv
+import concurrent.futures
+import multiprocessing
 
 # Suppress warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -49,6 +51,7 @@ class GraphEncoder(torch.nn.Module):
         
         prev_dim = input_dim
         for hidden_dim in hidden_dims:
+            # Assuming AutoEncoder class is defined elsewhere as per your snippet
             self.autoencoders.append(AutoEncoder(prev_dim, hidden_dim))
             prev_dim = hidden_dim
 
@@ -84,14 +87,12 @@ class GraphEncoder(torch.nn.Module):
         for i, autoencoder in enumerate(self.autoencoders):
             autoencoder = autoencoder.to(device)
             optimizer = torch.optim.AdamW(autoencoder.parameters(), lr=lr, weight_decay=1e-4)
-            
-            # Optimization: Compile the model
             training_model = autoencoder
 
             dataset = torch.utils.data.TensorDataset(current_input)
             dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
             
-            desc = f"Training Layer {i+1}/{len(self.autoencoders)}"
+            desc = f"Pretraining Layer {i+1}/{len(self.autoencoders)}"
             pbar = tqdm.tqdm(range(epochs_per_layer), desc=desc, leave=False)
             for _ in pbar:
                 for (x_batch,) in dataloader:
@@ -108,11 +109,47 @@ class GraphEncoder(torch.nn.Module):
                 
         return self
 
+    def fine_tune(self, x_data, epochs, lr, batch_size, beta, rho, device='cpu'):
+        """
+        Performs Global Fine-Tuning.
+        Optimizes the entire stack simultaneously to minimize total reconstruction error.
+        """
+        self.to(device)
+        
+        # Optimizer for ALL parameters in the network
+        optimizer = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=1e-4)
+        
+        dataset = torch.utils.data.TensorDataset(x_data.clone())
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        
+        pbar = tqdm.tqdm(range(epochs), desc="Global Fine-Tuning", leave=False)
+        for _ in pbar:
+            total_loss = 0
+            for (x_batch,) in dataloader:
+                x_batch = x_batch.to(device)
+                optimizer.zero_grad()
+                
+                # Full forward pass through the entire stack
+                encoded, decoded = self.forward(x_batch)
+                
+                # Compute loss on final reconstruction against original input
+                loss = self._compute_loss(x_batch, decoded, encoded, rho, beta)
+                
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            
+            pbar.set_postfix(avg_loss=total_loss / len(dataloader))
+            
+        return self
+
+
 class DenoisingGraphEncoder(GraphEncoder):
     def __init__(self, input_dim, hidden_dims, noise_level=0.1):
         super().__init__(input_dim, hidden_dims)
         self.noise_level = noise_level
 
+    # fit method overrides the parent's fit to add noise
     def fit(self, x_data, epochs_per_layer, lr, batch_size, beta, rho, device='cpu'):
         """Performs Greedy Layer-wise Pretraining with Masking Noise."""
         current_input = x_data.clone().to(device)
@@ -120,16 +157,12 @@ class DenoisingGraphEncoder(GraphEncoder):
         for i, autoencoder in enumerate(self.autoencoders):
             autoencoder = autoencoder.to(device)
             optimizer = torch.optim.AdamW(autoencoder.parameters(), lr=lr, weight_decay=1e-4)
-            
-            # Optimization: Compile the model
             training_model = autoencoder
-
-            
 
             dataset = torch.utils.data.TensorDataset(current_input)
             dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
             
-            desc = f"Training Robust Layer {i+1}/{len(self.autoencoders)}"
+            desc = f"Pretraining Robust Layer {i+1}/{len(self.autoencoders)}"
             pbar = tqdm.tqdm(range(epochs_per_layer), desc=desc, leave=False)
             for _ in pbar:
                 for (x_batch,) in dataloader:
@@ -241,7 +274,17 @@ def evaluate_clustering(encoded_features, s_matrix, true_labels, n_tests=20):
         
     return nmi, ncut
 
-def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100):
+def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100, use_cpu_only=False):
+    """
+    Refactored to accept a CPU-force flag for better parallel stability.
+    """
+    # 1. Force CPU if requested (prevents GPU OOM during parallel runs)
+    if use_cpu_only:
+        device = 'cpu'
+    else:
+        device = ('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # 2. Load Dataset
     try:
         s, nts, y = load_dataset(dataset_name)
     except Exception as e:
@@ -315,6 +358,7 @@ def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100):
 
         try:
             model.fit(x_tensor, epochs, lr, x_tensor.shape[0], beta, rho, device=device)
+            model.fine_tune(x_tensor, epochs, lr, x_tensor.shape[0], beta, rho, device=device)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
         except Exception as e:
@@ -389,6 +433,7 @@ def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100):
 
         try:
             model.fit(x_tensor, epochs, lr, x_tensor.shape[0], beta, rho, device=device)
+            model.fine_tune(x_tensor, epochs, lr, x_tensor.shape[0], beta, rho, device=device)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
         except Exception as e:
@@ -457,23 +502,26 @@ def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100):
         "AE_Params": str(study.best_params),
         "RobustSAE_Params": str(study_robust.best_params)
     }
-
+# ==========================================
+# PARALLEL EXECUTION BLOCK
+# ==========================================
 if __name__ == "__main__":
-    import csv
-    
-    # List of all datasets to run
-    datasets = [ 
-        'polbooks', 'football'
-    ]
-    
-    # Configuration
+    multiprocessing.set_start_method('spawn', force=True)
+    # 1. Configuration
+    datasets = ['lfr_0.20'] # Add your datasets here
     n_trials = 10
     kmeans_tests = 100
-    output_file = "experiment_results_1.csv"
+    output_file = "experiment_results_lfr_0.2.csv"
     
-    results = []
+    # Number of concurrent processes. 
+    # Usually set to number of CPU cores or slightly less.
+    # If using GPU, set this low (e.g., 2) to avoid OOM.
+    MAX_WORKERS = 4 
     
-    # Initialize CSV file with headers
+    # FORCE_CPU: Set True if you get CUDA Out Of Memory errors.
+    FORCE_CPU = False 
+
+    # 2. Setup CSV
     fieldnames = [
         "Dataset", 
         "KMeans_NMI", "KMeans_Ncut", 
@@ -483,21 +531,40 @@ if __name__ == "__main__":
         "AE_Params", "RobustSAE_Params"
     ]
     
-    # Check if file exists to avoid overwriting if we want to append (optional, here we overwrite)
+    # Initialize file
     with open(output_file, mode='w', newline='') as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()
 
-    for dataset in datasets:
-        print(f"\nProcessing dataset: {dataset}")
-        result = run_experiment(dataset, n_trials=n_trials, nb_kmeans_tests=kmeans_tests)
+    print(f"[*] Starting parallel execution with {MAX_WORKERS} workers...")
+    
+    # 3. Process Pool Executor
+    # This creates a pool of separate processes (bypassing the Python GIL)
+    with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
         
-        if result:
-            results.append(result)
-            
-            # Append result to CSV immediately
-            with open(output_file, mode='a', newline='') as csv_file:
-                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-                writer.writerow(result)
+        # Submit all tasks to the pool
+        # We store the 'future' object as a key and the dataset name as value
+        future_to_dataset = {
+            executor.submit(run_experiment, d, n_trials, kmeans_tests, FORCE_CPU): d 
+            for d in datasets
+        }
+        
+        # Process results as they complete (in any order)
+        for future in concurrent.futures.as_completed(future_to_dataset):
+            dataset_name = future_to_dataset[future]
+            try:
+                result = future.result() # Blocks until this specific task is done
                 
+                if result:
+                    # Write to CSV immediately (Thread-safe because only Main Thread writes)
+                    with open(output_file, mode='a', newline='') as csv_file:
+                        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                        writer.writerow(result)
+                    print(f"[+] Finished processing: {dataset_name}")
+                else:
+                    print(f"[-] returned None for: {dataset_name}")
+                    
+            except Exception as exc:
+                print(f"[!] {dataset_name} generated an exception: {exc}")
+
     print(f"\nAll experiments completed. Results saved to {output_file}")
