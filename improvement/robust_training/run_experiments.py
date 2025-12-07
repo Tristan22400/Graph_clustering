@@ -6,6 +6,7 @@ import sklearn
 import sklearn.datasets
 import sklearn.metrics
 import sklearn.cluster
+import sklearn.mixture
 import sklearn.preprocessing
 import networkx as nx
 import random
@@ -261,18 +262,60 @@ def evaluate_clustering(encoded_features, s_matrix, true_labels, n_tests=20):
     
     n_clusters = len(set(true_labels))
     
+    # 1. K-Means
     kmeans = sklearn.cluster.KMeans(
         n_clusters=n_clusters, 
         algorithm="lloyd", 
         n_init=n_tests, 
         random_state=42
     )
-    y_pred = kmeans.fit_predict(encoded_features)
+    y_pred_km = kmeans.fit_predict(encoded_features)
     
-    nmi = sklearn.metrics.normalized_mutual_info_score(true_labels, y_pred)
-    ncut = compute_ncut(s_matrix, y_pred)
+    nmi_km = sklearn.metrics.normalized_mutual_info_score(true_labels, y_pred_km)
+    ncut_km = compute_ncut(s_matrix, y_pred_km)
+
+    # 2. Gaussian Mixture Model (GMM)
+    # GMM can be sensitive to initialization. We use n_init to restart.
+    
+    # Preprocessing: Scale features to improve convergence and stability
+    scaler = sklearn.preprocessing.StandardScaler()
+    encoded_features_scaled = scaler.fit_transform(encoded_features)
+    
+    try:
+        # Try with default full covariance and slightly higher regularization
+        gmm = sklearn.mixture.GaussianMixture(
+            n_components=n_clusters,
+            n_init=n_tests,
+            random_state=42,
+            reg_covar=1e-5  # Increased from default 1e-6 for stability
+        )
+        y_pred_gmm = gmm.fit_predict(encoded_features_scaled)
+        nmi_gmm = sklearn.metrics.normalized_mutual_info_score(true_labels, y_pred_gmm)
+        ncut_gmm = compute_ncut(s_matrix, y_pred_gmm)
         
-    return nmi, ncut
+    except Exception as e:
+        print(f"[!] GMM (Full) failed: {e}. Retrying with Diagonal covariance...")
+        try:
+            # Fallback: Diagonal covariance is much more stable
+            gmm = sklearn.mixture.GaussianMixture(
+                n_components=n_clusters,
+                n_init=n_tests,
+                random_state=42,
+                covariance_type='diag',
+                reg_covar=1e-4
+            )
+            y_pred_gmm = gmm.fit_predict(encoded_features_scaled)
+            nmi_gmm = sklearn.metrics.normalized_mutual_info_score(true_labels, y_pred_gmm)
+            ncut_gmm = compute_ncut(s_matrix, y_pred_gmm)
+        except Exception as e2:
+            print(f"[!] GMM (Diag) failed: {e2}")
+            nmi_gmm = 0.0
+            ncut_gmm = float('inf')
+        
+    return {
+        "kmeans": {"nmi": nmi_km, "ncut": ncut_km},
+        "gmm":    {"nmi": nmi_gmm, "ncut": ncut_gmm}
+    }
 
 def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100, use_cpu_only=False):
     """
@@ -297,9 +340,13 @@ def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100, use_cpu_only=
     x_tensor = torch.tensor(nts, dtype=torch.float32)
     n_clusters = len(set(y))
 
-    # --- 1. Baseline: Standard K-Means on Raw Data ---
-    print("[-] Running Baseline: K-Means on Raw Data...")
-    km_nmi, km_ncut = evaluate_clustering(nts, s, y, n_tests=nb_kmeans_tests) 
+    # --- 1. Baseline: Standard K-Means & GMM on Raw Data ---
+    print("[-] Running Baseline: K-Means & GMM on Raw Data...")
+    res_base = evaluate_clustering(nts, s, y, n_tests=nb_kmeans_tests)
+    km_nmi = res_base['kmeans']['nmi']
+    km_ncut = res_base['kmeans']['ncut']
+    gmm_nmi = res_base['gmm']['nmi']
+    gmm_ncut = res_base['gmm']['ncut'] 
     
     # --- 2. Baseline: Spectral Clustering ---
     print("[-] Running Baseline: Spectral Clustering...")
@@ -322,12 +369,15 @@ def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100, use_cpu_only=
     print(f"[-] Starting Optuna Optimization ({n_trials} trials)...")
     
     # Variables to track "Real Life" performance
-    # We track the NMI specifically associated with the lowest Ncut found so far.
-    best_ncut_val = float('inf')
-    nmi_of_best_ncut = 0.0
+    # We track best Ncut for both K-Means and GMM independently
+    best_ae_kmeans_ncut = float('inf')
+    best_ae_kmeans_nmi = 0.0
+    
+    best_ae_gmm_ncut = float('inf')
+    best_ae_gmm_nmi = 0.0
     
     def objective(trial):
-        nonlocal best_ncut_val, nmi_of_best_ncut
+        nonlocal best_ae_kmeans_ncut, best_ae_kmeans_nmi, best_ae_gmm_ncut, best_ae_gmm_nmi
         
         seed = 97
         torch.manual_seed(seed)
@@ -376,15 +426,21 @@ def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100, use_cpu_only=
                 return float('inf')
             
             try:
-                nmi_test, ncut_test = evaluate_clustering(encoded_np, s, y, n_tests=nb_kmeans_tests)
-            
-                # We only record the NMI if the Ncut is better than what we've seen.
-                # This mimics "Real Life" selection where we only know Ncut.
-                if ncut_test < best_ncut_val:
-                    best_ncut_val = ncut_test
-                    nmi_of_best_ncut = nmi_test
+                res = evaluate_clustering(encoded_np, s, y, n_tests=nb_kmeans_tests)
                 
-                return ncut_test
+                # Update Best KMeans
+                if res['kmeans']['ncut'] < best_ae_kmeans_ncut:
+                    best_ae_kmeans_ncut = res['kmeans']['ncut']
+                    best_ae_kmeans_nmi = res['kmeans']['nmi']
+                
+                # Update Best GMM
+                if res['gmm']['ncut'] < best_ae_gmm_ncut:
+                    best_ae_gmm_ncut = res['gmm']['ncut']
+                    best_ae_gmm_nmi = res['gmm']['nmi']
+                
+                # Optimization Target: Minimize the BEST Ncut found by either method
+                # This encourages the model to find a representation good for AT LEAST one clustering method
+                return min(res['kmeans']['ncut'], res['gmm']['ncut'])
             except sklearn.exceptions.ConvergenceWarning:
                 return float('inf')
 
@@ -397,11 +453,15 @@ def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100, use_cpu_only=
     # --- 4. Optuna Study for Robust Autoencoder ---
     print(f"[-] Starting Optuna Optimization for Robust SAE ({n_trials} trials)...")
     
-    study_robust_best_nmi = 0.0
-    study_robust_best_ncut = float('inf')
+    study_robust_best_kmeans_nmi = 0.0
+    study_robust_best_kmeans_ncut = float('inf')
+    
+    study_robust_best_gmm_nmi = 0.0
+    study_robust_best_gmm_ncut = float('inf')
 
     def objective_robust(trial):
-        nonlocal study_robust_best_nmi, study_robust_best_ncut
+        nonlocal study_robust_best_kmeans_nmi, study_robust_best_kmeans_ncut
+        nonlocal study_robust_best_gmm_nmi, study_robust_best_gmm_ncut
         
         seed = 97
         torch.manual_seed(seed)
@@ -451,13 +511,19 @@ def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100, use_cpu_only=
                 return float('inf')
             
             try:
-                nmi_test, ncut_test = evaluate_clustering(encoded_np, s, y, n_tests=nb_kmeans_tests)
+                res = evaluate_clustering(encoded_np, s, y, n_tests=nb_kmeans_tests)
                 
-                if ncut_test < study_robust_best_ncut:
-                    study_robust_best_ncut = ncut_test
-                    study_robust_best_nmi = nmi_test
+                # Update Best KMeans
+                if res['kmeans']['ncut'] < study_robust_best_kmeans_ncut:
+                    study_robust_best_kmeans_ncut = res['kmeans']['ncut']
+                    study_robust_best_kmeans_nmi = res['kmeans']['nmi']
+
+                # Update Best GMM
+                if res['gmm']['ncut'] < study_robust_best_gmm_ncut:
+                    study_robust_best_gmm_ncut = res['gmm']['ncut']
+                    study_robust_best_gmm_nmi = res['gmm']['nmi']
                 
-                return ncut_test
+                return min(res['kmeans']['ncut'], res['gmm']['ncut'])
             except sklearn.exceptions.ConvergenceWarning:
                 return float('inf')
 
@@ -468,37 +534,63 @@ def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100, use_cpu_only=
     # ==========================================
     # FINAL REPORT
     # ==========================================
-    print("\n" + "="*70)
+    # ==========================================
+    # FINAL REPORT
+    # ==========================================
+    print("\n" + "="*80)
     print(f"FINAL RESULTS FOR DATASET: {dataset_name}")
-    print("="*70)
+    print("="*80)
     
     # Header
-    print(f"{'METHOD':<25} | {'NMI (Higher is better)':<22} | {'Ncut (Lower is better)':<22}")
-    print("-" * 70)
+    print(f"{'METHOD':<30} | {'NMI (Higher is better)':<22} | {'Ncut (Lower is better)':<22}")
+    print("-" * 80)
     
     # Rows
-    print(f"{'K-Means (Raw Data)':<25} | {km_nmi:<22.4f} | {km_ncut:<22.4f}")
-    print(f"{'Spectral Clustering':<25} | {spec_nmi:<22.4f} | {spec_ncut:<22.4f}")
-    print(f"{'Autoencoder (Optuna)':<25} | {nmi_of_best_ncut:<22.4f} | {study.best_value:<22.4f} ")
-    print(f"{'Robust SAE (Optuna)':<25} | {study_robust_best_nmi:<22.4f} | {study_robust.best_value:<22.4f} | {study_robust_best_ncut:<22.4f}")
+    print(f"{'K-Means (Raw Data)':<30} | {km_nmi:<22.4f} | {km_ncut:<22.4f}")
+    print(f"{'GMM (Raw Data)':<30} | {gmm_nmi:<22.4f} | {gmm_ncut:<22.4f}")
+    print(f"{'Spectral Clustering':<30} | {spec_nmi:<22.4f} | {spec_ncut:<22.4f}")
+    print("-" * 80)
+    print(f"{'AE + K-Means':<30} | {best_ae_kmeans_nmi:<22.4f} | {best_ae_kmeans_ncut:<22.4f}")
+    print(f"{'AE + GMM':<30} | {best_ae_gmm_nmi:<22.4f} | {best_ae_gmm_ncut:<22.4f}")
+    print(f"{'AE (Optuna Min)':<30} | {'-':<22} | {study.best_value:<22.4f}")
+    print("-" * 80)
+    print(f"{'Robust SAE + K-Means':<30} | {study_robust_best_kmeans_nmi:<22.4f} | {study_robust_best_kmeans_ncut:<22.4f}")
+    print(f"{'Robust SAE + GMM':<30} | {study_robust_best_gmm_nmi:<22.4f} | {study_robust_best_gmm_ncut:<22.4f}")
+    print(f"{'Robust SAE (Optuna Min)':<30} | {'-':<22} | {study_robust.best_value:<22.4f}")
     
-    print("-" * 70)
+    print("-" * 80)
     print(f"[*] Best AE Params: {study.best_params}")
     print(f"[*] Best Robust AE Params: {study_robust.best_params}")
-    print("="*70 + "\n")
+    print("="*80 + "\n")
 
     return {
         "Dataset": dataset_name,
-        "KMeans_NMI": km_nmi,
-        "KMeans_Ncut": km_ncut,
+        
+        "KMeans_Raw_NMI": km_nmi,
+        "KMeans_Raw_Ncut": km_ncut,
+        
+        "GMM_Raw_NMI": gmm_nmi,
+        "GMM_Raw_Ncut": gmm_ncut,
+        
         "Spectral_NMI": spec_nmi,
         "Spectral_Ncut": spec_ncut,
-        "AE_NMI": nmi_of_best_ncut,
-        "AE_Ncut": best_ncut_val,
-        "AE_Ncut_Optuna": study.best_value,
-        "RobustSAE_NMI": study_robust_best_nmi,
-        "RobustSAE_Ncut": study_robust_best_ncut,
-        "RobustSAE_Ncut_Optuna": study_robust.best_value,
+        
+        "AE_KMeans_NMI": best_ae_kmeans_nmi,
+        "AE_KMeans_Ncut": best_ae_kmeans_ncut,
+        
+        "AE_GMM_NMI": best_ae_gmm_nmi,
+        "AE_GMM_Ncut": best_ae_gmm_ncut,
+        
+        "AE_Optuna_Min": study.best_value,
+        
+        "RobustSAE_KMeans_NMI": study_robust_best_kmeans_nmi,
+        "RobustSAE_KMeans_Ncut": study_robust_best_kmeans_ncut,
+        
+        "RobustSAE_GMM_NMI": study_robust_best_gmm_nmi,
+        "RobustSAE_GMM_Ncut": study_robust_best_gmm_ncut,
+        
+        "RobustSAE_Optuna_Min": study_robust.best_value,
+
         "AE_Params": str(study.best_params),
         "RobustSAE_Params": str(study_robust.best_params)
     }
@@ -508,10 +600,10 @@ def run_experiment(dataset_name, n_trials=20, nb_kmeans_tests=100, use_cpu_only=
 if __name__ == "__main__":
     multiprocessing.set_start_method('spawn', force=True)
     # 1. Configuration
-    datasets = ['lfr_0.20'] # Add your datasets here
+    datasets = ['karate'] # Add your datasets here
     n_trials = 10
     kmeans_tests = 100
-    output_file = "experiment_results_lfr_0.2.csv"
+    output_file = "experiment_results_karate.csv"
     
     # Number of concurrent processes. 
     # Usually set to number of CPU cores or slightly less.
@@ -524,10 +616,15 @@ if __name__ == "__main__":
     # 2. Setup CSV
     fieldnames = [
         "Dataset", 
-        "KMeans_NMI", "KMeans_Ncut", 
+        "KMeans_Raw_NMI", "KMeans_Raw_Ncut", 
+        "GMM_Raw_NMI", "GMM_Raw_Ncut",
         "Spectral_NMI", "Spectral_Ncut", 
-        "AE_NMI", "AE_Ncut", "AE_Ncut_Optuna",
-        "RobustSAE_NMI", "RobustSAE_Ncut", "RobustSAE_Ncut_Optuna",
+        "AE_KMeans_NMI", "AE_KMeans_Ncut",
+        "AE_GMM_NMI", "AE_GMM_Ncut",
+        "AE_Optuna_Min",
+        "RobustSAE_KMeans_NMI", "RobustSAE_KMeans_Ncut", 
+        "RobustSAE_GMM_NMI", "RobustSAE_GMM_Ncut",
+        "RobustSAE_Optuna_Min",
         "AE_Params", "RobustSAE_Params"
     ]
     
